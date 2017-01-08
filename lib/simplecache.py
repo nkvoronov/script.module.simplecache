@@ -1,253 +1,269 @@
-#!/usr/bin/python
 # -*- coding: utf-8 -*-
-
-'''provides a simple stateless caching system for Kodi addons and plugins'''
-
-import xbmcvfs
-import xbmcgui
-import xbmc
+import xbmcvfs, xbmcgui, xbmc
+import re, base64, zlib
 import datetime
-import time
-import sqlite3
-from functools import reduce
+import unicodedata
+import threading, thread
+import atexit
 
+DEFAULTCACHEPATH = "special://profile/addon_data/script.module.simplecache/"
 
 class SimpleCache(object):
     '''simple stateless caching system for Kodi'''
+    mem_cache = {}
     exit = False
-    auto_clean_interval = datetime.timedelta(hours=4)
-    enable_mem_cache = True
+    auto_clean_interval = 3600 #cleanup every 60 minutes (3600 seconds)
+    enable_win_cache = True
+    enable_file_cache = True
     win = None
     busy_tasks = []
-    multithreaded = False
-    database = None
 
-    def __init__(self):
+    def __init__(self, autocleanup=False):
         '''Initialize our caching class'''
         self.win = xbmcgui.Window(10000)
         self.monitor = xbmc.Monitor()
-        self.check_cleanup()
+        if autocleanup:
+            thread = threading.Thread(target=self.auto_cleanup, args=())
+            thread.daemon = True
+            thread.start()
+        else:
+            self.manual_cleanup()
         self.log_msg("Initialized")
 
     def close(self):
-        '''tell any tasks to stop immediately (as we can be called multithreaded) and cleanup objects'''
+        '''tell background thread(s) to stop immediately and cleanup objects'''
         self.exit = True
-        # wait for all tasks to complete
+        #wait for all tasks to complete
+        xbmc.sleep(25)
         while self.busy_tasks:
             xbmc.sleep(25)
-        self.win = None
-        self.monitor = None
         del self.win
         del self.monitor
-        self.log_msg("Closed")
+        self.log_msg("Exited")
 
-    def __del__(self):
-        '''make sure close is called'''
-        if not self.exit:
-            self.close()
-
-    def get(self, endpoint, checksum=""):
+    def get( self, endpoint, checksum=""):
         '''
             get object from cache and return the results
             endpoint: the (unique) name of the cache object as reference
-            checkum: optional argument to check if the checksum in the cacheobject matches the checkum provided
+            checkum: optional argument to check if the cacheobjects matches the checkum
         '''
-        checksum = self.get_checksum(checksum)
-        cur_time = self.get_timestamp(datetime.datetime.now())
+        cur_time = datetime.datetime.now()
+        #1: try memory cache first - only for objects that can be accessed by the same instance calling the addon!
+        if endpoint in self.mem_cache:
+            cachedata = self.mem_cache[endpoint]
+            if not checksum or checksum == cachedata["checksum"]:
+                return cachedata["data"]
 
-        # 1: try memory cache first
-        if self.enable_mem_cache:
-            result = self.get_mem_cache(endpoint, checksum, cur_time)
+        #2: try self.win property cache - usefull for plugins and scripts which dont run in the background
+        cache_name = self.get_cache_name(endpoint)
+        cache = self.win.getProperty(cache_name.encode("utf-8")).decode("utf-8")
+        if self.enable_win_cache and cache:
+            cachedata = eval(cache)
+            if cachedata["expires"] > cur_time:
+                if not checksum or checksum == cachedata["checksum"]:
+                    return cachedata["data"]
 
-        # 2: fallback to database cache
-        if result is None:
-            result = self.get_db_cache(endpoint, checksum, cur_time)
+        #3: fallback to local file cache
+        cachefile = self.get_cache_file(endpoint)
+        if self.enable_file_cache and xbmcvfs.exists(cachefile):
+            cachedata = self.read_cachefile(cachefile)
+            if cachedata and cachedata["expires"] > cur_time:
+                if not checksum or checksum == cachedata["checksum"]:
+                    return cachedata["data"]
 
-        return result
+        return None
 
-    def set(self, endpoint, data, checksum="", expiration=datetime.timedelta(days=30)):
+    def set( self, endpoint, data, checksum="", expiration=datetime.timedelta(days=30), mem_cache=False):
         '''
-            set data in cache
+            set an object in the cache
+            endpoint: the (unique) name of the cache object as reference
+            data: the data to store in the cache(can be any serializable python object)
+            checkum: optional checksum to store in the cache
+            expiration: set expiration of the object in the cache as timedelta
+            mem_cache: optional bool - store in memory instead of window props - practical if used within same instance
         '''
-        task_name = "set.%s" % endpoint
-        self.busy_tasks.append(task_name)
-        checksum = self.get_checksum(checksum)
-        expires = self.get_timestamp(datetime.datetime.now() + expiration)
+        thread.start_new_thread(self.set_internal, (endpoint,data,checksum,expiration,mem_cache))
 
-        # memory cache: write to window property
-        if self.enable_mem_cache and not self.exit:
-            self.set_mem_cache(endpoint, checksum, expires, data)
-
-        # db cache
-        if not self.exit:
-            self.set_db_cache(endpoint, checksum, expires, data)
-
-        # remove this task from list
-        self.busy_tasks.remove(task_name)
-
-    def get_mem_cache(self, endpoint, checksum, cur_time):
+    def set_internal( self, endpoint, data, checksum, expiration, mem_cache):
         '''
-            get cache data from memory cache
-            we use window properties because we need to be stateless
+            internal method is called multithreaded so saving happens in the background
+            and doesn't block the main code execution (as file writes can be file consuming)
         '''
-        result = None
-        cachedata = self.win.getProperty(endpoint.encode("utf-8"))
-        if cachedata:
-            cachedata = eval(cachedata)
-            if cachedata[0] > cur_time:
-                if not checksum or checksum == cachedata[2]:
-                    result = cachedata[1]
-        return result
+        cache_name = self.get_cache_name(endpoint)
+        cur_time = datetime.datetime.now()
+        self.busy_tasks.append(cur_time)
+        cachedata = { "date": cur_time, "endpoint":endpoint, "checksum":checksum, "data": data }
+        memory_expiration = datetime.timedelta(minutes=self.auto_clean_interval)
 
-    def set_mem_cache(self, endpoint, checksum, expires, data):
-        '''
-            window property cache as alternative for memory cache
-            usefull for (stateless) plugins
-        '''
-        cachedata = (expires, data, checksum)
-        cachedata_str = repr(cachedata).encode("utf-8")
-        self.win.setProperty(endpoint.encode("utf-8"), cachedata_str)
+        if expiration < memory_expiration:
+            mem_expires = cur_time + expiration
+        else:
+            mem_expires = cur_time + memory_expiration
+        cachedata["expires"] = mem_expires
 
-    def get_db_cache(self, endpoint, checksum, cur_time):
-        '''get cache data from sqllite database'''
-        result = None
-        query = "SELECT expires, data, checksum FROM simplecache WHERE id = ?"
-        cache_data = self.execute_sql(query, (endpoint,))
-        if cache_data:
-            cache_data = cache_data.fetchone()
-            if cache_data and cache_data[0] > cur_time:
-                if not checksum or cache_data[2] == checksum:
-                    result = eval(cache_data[1])
-                    # also set result in memory cache for further access
-                    if self.enable_mem_cache:
-                        self.set_mem_cache(endpoint, checksum, cache_data[0], result)
-        return result
+        #save in memory cache - only if allowed
+        if mem_cache:
+            self.mem_cache[endpoint] = cachedata
+        else:
+            #window property cache
+            #writes the data both in it's own self.win property and to a global list
+            #the global list is used to determine when objects should be deleted from the memory cache
+            cachedata_str = repr(cachedata).encode("utf-8")
+            if self.enable_win_cache:
+                all_win_cache_objects = self.win.getProperty("script.module.simplecache.cacheobjects").decode("utf-8")
+                if all_win_cache_objects:
+                    all_win_cache_objects = eval(all_win_cache_objects)
+                else:
+                    all_win_cache_objects = []
+                all_win_cache_objects.append( (cache_name, mem_expires) )
+                self.win.setProperty("script.module.simplecache.cacheobjects",
+                    repr(all_win_cache_objects).encode("utf-8"))
+                self.win.setProperty(cache_name.encode("utf-8"), cachedata_str)
+            
+        #file cache only if cache persistance needs to be larger than memory cache expiration
+        #dumps the data into a zlib compressed file on disk
+        if self.enable_file_cache and expiration > memory_expiration:
+            cachedata["expires"] = cur_time + expiration
+            cachedata_str = repr(cachedata).encode("utf-8")
+            if not xbmcvfs.exists(DEFAULTCACHEPATH):
+                xbmcvfs.mkdirs(DEFAULTCACHEPATH)
 
-    def set_db_cache(self, endpoint, checksum, expires, data):
-        ''' store cache data in database '''
-        query = "INSERT OR REPLACE INTO simplecache( id, expires, data, checksum) VALUES (?, ?, ?, ?)"
-        data = repr(data)
-        self.execute_sql(query, (endpoint, expires, data, checksum))
+            cachefile = self.get_cache_file(endpoint)
+            _file = xbmcvfs.File(cachefile.encode("utf-8"), 'w')
+            cachedata = zlib.compress(cachedata_str)
+            _file.write(cachedata)
+            _file.close()
+            del _file
+        #remove task from list
+        self.busy_tasks.remove(cur_time)
 
-    def check_cleanup(self):
-        '''check if cleanup is needed'''
+    def auto_cleanup(self):
+        '''auto cleanup to remove any expired cache objects - usefull for services'''
+        self.log_msg("Auto cleanup backgroundworker started...")
+        self.busy_tasks.append("auto_cleanup")
+        cur_tick = 0
+        while not (self.exit or self.monitor.abortRequested()):
+            if cur_tick == self.auto_clean_interval:
+                cur_tick = 0
+                self.do_cleanup()
+            else:
+                cur_tick += 5
+            self.monitor.waitForAbort(5)
+        self.busy_tasks.remove("auto_cleanup")
+        self.log_msg("Auto cleanup backgroundworker stopped...")
+
+    def manual_cleanup(self):
+        '''manual cleanup to start only at initialization if autoclean worker is disabled - usefull for plugins'''
         cur_time = datetime.datetime.now()
         lastexecuted = self.win.getProperty("simplecache.clean.lastexecuted")
+        memory_expiration = datetime.timedelta(seconds=self.auto_clean_interval)
         if not lastexecuted:
-            self.win.setProperty("simplecache.clean.lastexecuted", repr(cur_time))
-        elif (eval(lastexecuted) + self.auto_clean_interval) < cur_time:
-            # cleanup needed...
+            self.win.setProperty("simplecache.clean.lastexecuted",repr(cur_time))
+        elif (eval(lastexecuted) + memory_expiration) < cur_time:
+            #cleanup needed...
             self.do_cleanup()
 
     def do_cleanup(self):
         '''perform cleanup task'''
-        if self.exit or self.monitor.abortRequested():
+        if self.exit:
             return
-        self.busy_tasks.append(__name__)
         cur_time = datetime.datetime.now()
-        cur_timestamp = self.get_timestamp(cur_time)
-        self.log_msg("Running cleanup...")
-        if self.win.getProperty("simplecachecleanbusy"):
-            return
-        self.win.setProperty("simplecachecleanbusy", "busy")
+        self.busy_tasks.append(cur_time)
+        self.win.setProperty("simplecache.clean.lastexecuted",repr(cur_time))
+        self.log_msg("Running cleanup...", xbmc.LOGNOTICE)
 
-        query = "SELECT id, expires FROM simplecache"
-        for cache_data in self.execute_sql(query).fetchall():
-            if self.exit or self.monitor.abortRequested():
-                return
-            # always cleanup all memory objects on each interval
-            self.win.clearProperty(cache_data[0].encode("utf-8"))
-            # clean up db cache object only if expired
-            if cache_data[1] < cur_timestamp:
-                query = 'DELETE FROM simplecache WHERE id = ?'
-                self.execute_sql(query, (cache_data[0],))
-                self.log_msg("delete from db %s" % cache_data[0])
+        #cleanup memory cache objects
+        keys_to_delete = []
+        for key, value in self.mem_cache.iteritems():
+            if value["expires"] < cur_time:
+                keys_to_delete.append(key)
+        temp_dict = dict(self.mem_cache)
+        for key in keys_to_delete:
+            del temp_dict[key]
+        self.mem_cache = temp_dict
 
-        # compact db
-        self.execute_sql("VACUUM")
+        #cleanup winprops cache objects
+        all_win_cache_objects = self.win.getProperty("script.module.simplecache.cacheobjects").decode("utf-8")
+        if all_win_cache_objects:
+            cacheObjects = []
+            for item in eval(all_win_cache_objects):
+                if item[1] <= cur_time:
+                    self.win.clearProperty(item[0].encode("utf-8"))
+                else:
+                    cacheObjects.append(item)
+                if self.monitor.abortRequested():
+                    return
+            #Store our list with cacheobjects again
+            self.win.setProperty("script.module.simplecache.cacheobjects",repr(cacheObjects).encode("utf-8"))
 
-        # remove task from list
-        self.busy_tasks.remove(__name__)
-        self.win.setProperty("simplecache.clean.lastexecuted", repr(cur_time))
-        self.win.clearProperty("simplecachecleanbusy")
-        self.log_msg("Auto cleanup done")
-
-    def get_database(self):
-        '''get reference to our sqllite database - performs basic integrity check'''
-        try:
-            dbpath = xbmc.translatePath("special://database/simplecache.db").decode('utf-8')
-            connection = sqlite3.connect(dbpath, timeout=30, isolation_level=None)
-            connection.execute('SELECT * FROM simplecache LIMIT 1')
-            return connection
-        except Exception as error:
-            # our database is corrupt or doesn't exist yet, we simply try to recreate it
-            connection.close()
-            del connection
-            xbmcvfs.delete(dbpath)
-            xbmc.sleep(500)
-            try:
-                connection = sqlite3.connect(dbpath, timeout=30, isolation_level=None)
-                connection.execute(
-                    """CREATE TABLE IF NOT EXISTS simplecache(
-                    id TEXT UNIQUE, expires INTEGER, data TEXT, checksum INTEGER)""")
-                return connection
-            except Exception as error:
-                self.log_msg("Exception while initializing database: %s" % str(error), xbmc.LOGWARNING)
-                self.close()
-                return None
-
-    def execute_sql(self, query, data=None):
-        '''little wrapper around execute and executemany to just retry a db command if db is locked'''
-        retries = 0
-        result = None
-        error = None
-        # always use new db object because we need to be sure that data is available for other simplecache instances
-        with self.get_database() as database:
-            while not retries == 10:
-                if self.exit:
-                    return None
+        #cleanup file cache objects
+        if xbmcvfs.exists(DEFAULTCACHEPATH):
+            files = xbmcvfs.listdir(DEFAULTCACHEPATH)[1]
+            for file in files:
+                #check filebased cache for expired items
+                if self.monitor.abortRequested():
+                    return
+                cachefile = DEFAULTCACHEPATH + file
+                f = xbmcvfs.File(cachefile, 'r')
+                text =  f.read()
+                f.close()
+                del f
                 try:
-                    if isinstance(data, list):
-                        result = database.executemany(query, data)
-                    elif data:
-                        result = database.execute(query, data)
-                    else:
-                        result = database.execute(query)
-                    return result
-                except sqlite3.OperationalError as error:
-                    if "database is locked" in error:
-                        self.log_msg("retrying DB commit...")
-                        retries += 1
-                        self.monitor.waitForAbort(0.5)
-                    else:
-                        break
-                except Exception as error:
-                    break
-            self.log_msg("Database ERROR ! -- %s" % str(error), xbmc.LOGWARNING)
-        return None
+                    text = zlib.decompress(text).decode("utf-8")
+                    data = eval(text)
+                    if data["expires"] < cur_time:
+                        xbmcvfs.delete(cachefile)
+                except Exception:
+                    #delete any corrupted files
+                    xbmcvfs.delete(cachefile)
+        self.log_msg("Auto cleanup done",xbmc.LOGNOTICE)
+        #remove task from list
+        self.busy_tasks.remove(cur_time)
 
     @staticmethod
-    def log_msg(msg, loglevel=xbmc.LOGDEBUG):
+    def read_cachefile(cachefile):
+        '''try to read a file on disk and return the cache data'''
+        try:
+            f = xbmcvfs.File(cachefile.encode("utf-8"), 'r')
+            text =  f.read()
+            f.close()
+            del f
+            text = zlib.decompress(text).decode("utf-8")
+            data = eval(text)
+            return data
+        except Exception:
+            return {}
+
+    def get_cache_name( self, endpoint ):
+        '''helper to get our base64 representation of the cache identifier'''
+        value = base64.encodestring(self.try_encode(endpoint)).decode("utf-8")
+        value = unicodedata.normalize('NFKD', value).encode('ascii', 'ignore')
+        value = unicode(re.sub('[^\w\s-]', '', value).strip().lower())
+        value = unicode(re.sub('[-\s]+', '-', value))
+        return value
+
+    def get_cache_file( self, endpoint ):
+        '''helper to return the filename of the cachefile'''
+        return DEFAULTCACHEPATH + self.get_cache_name(endpoint)
+
+    ###### Utilities ##############################
+    @staticmethod
+    def try_encode(text, encoding="utf-8"):
+        '''helper to encode a string'''
+        try:
+            return text.encode(encoding,"ignore")
+        except Exception:
+            return text
+
+    @staticmethod
+    def log_msg(msg, loglevel = xbmc.LOGDEBUG):
         '''helper to send a message to the kodi log'''
         if isinstance(msg, unicode):
             msg = msg.encode('utf-8')
-        xbmc.log("Skin Helper Simplecache --> %s" % msg, level=loglevel)
+        xbmc.log("Skin Helper Simplecache --> %s" %msg, level=loglevel)
 
-    @staticmethod
-    def get_timestamp(date_time):
-        '''Converts a datetime object to unix timestamp'''
-        return int(time.mktime(date_time.timetuple()))
-
-    @staticmethod
-    def get_checksum(stringinput):
-        '''get int checksum from string'''
-        if not stringinput:
-            return 0
-        stringinput = str(stringinput)
-        return reduce(lambda x, y: x + y, map(ord, stringinput))
-
-
-def use_cache(cache_days=14):
+#decorator to use cache on classmethods
+def use_cache(cache_days=14, mem_cache=False):
     '''
         wrapper around our simple cache to use as decorator
         Usage: define an instance of SimpleCache with name "cache" (self.cache) in your class
@@ -255,16 +271,14 @@ def use_cache(cache_days=14):
         NOTE: use unnamed arguments for calling the method and named arguments for optional settings
     '''
     def decorator(func):
-        '''our decorator'''
-        def decorated(*args, **kwargs):
-            '''process the original method and apply caching of the results'''
+        def decorated( *args, **kwargs):
             method_class = args[0]
             method_class_name = method_class.__class__.__name__
-            cache_str = "%s.%s" % (method_class_name, func.__name__)
+            cache_str = "%s.%s" %(method_class_name, func.__name__)
             # cache identifier is based on positional args only
             # named args are considered optional and ignored
             for item in args[1:]:
-                cache_str += u".%s" % item
+                cache_str += u".%s" %item
             cache_str = cache_str.lower()
             cachedata = method_class.cache.get(cache_str)
             global_cache_ignore = False
@@ -272,11 +286,12 @@ def use_cache(cache_days=14):
                 global_cache_ignore = method_class.ignore_cache
             except Exception:
                 pass
-            if cachedata is not None and not kwargs.get("ignore_cache", False) and not global_cache_ignore:
+            if cachedata != None and not kwargs.get("ignore_cache",False) and not global_cache_ignore:
                 return cachedata
             else:
-                result = func(*args, **kwargs)
-                method_class.cache.set(cache_str, result, expiration=datetime.timedelta(days=cache_days))
+                result = func( *args, **kwargs)
+                method_class.cache.set(cache_str, result, expiration=datetime.timedelta(days=cache_days),
+                    mem_cache=mem_cache)
                 return result
         return decorated
     return decorator

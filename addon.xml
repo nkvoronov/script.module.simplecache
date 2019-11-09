@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<addon id="script.module.simplecache" name="Simple Cache Module" version="1.0.17.009" provider-name="marcelveldt, YLLOW_DRAGON">
+<addon id="script.module.simplecache" name="Simple Cache Module" version="1.0.17.010" provider-name="marcelveldt, YLLOW_DRAGON">
 	<requires>
 		<import addon="xbmc.python" version="2.26.0"/>
 	</requires>
@@ -7,8 +7,10 @@
 	<extension point="xbmc.addon.metadata">
 		<summary lang="en_GB">Provides a simple file- and memory based cache for Kodi addons</summary>
 		<summary lang="ru_RU">Предоставляет простой файл на основе кэш-памяти для KODI дополнений</summary>
+		<summary lang="uk_UA">Надає простий файл на основі кеш-пам'яті для KODI доповнень</summary>
 		<description lang="en_GB">Provides a simple file- and memory based cache for Kodi addons</description>
 		<description lang="ru_RU">Предоставляет простой файл на основе кэш-памяти для KODI дополнений</description>
+		<description lang="uk_UA">Надає простий файл на основі кеш-пам'яті для KODI доповнень</description>
 		<license>Apache 2.0</license>
 		<platform>all</platform>
 		<email>nkvoronov@gmail.com</email>
